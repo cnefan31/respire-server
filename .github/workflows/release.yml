@@ -172,17 +172,22 @@ jobs:
       - name: Inspect the archive contents
         run: |
           set -euo pipefail
+          # List the archive once and match against the captured list. Piping tar
+          # into `grep -q` would make grep exit at its first match, so tar would
+          # die on SIGPIPE and `pipefail` would report a false missing entry whose
+          # position in the listing happens to follow the match.
+          mapfile -t ENTRIES < <(tar -tzf "dist/${ASSET}")
           for required in \
             "${PKG_DIR}/bin/respire-server" \
             "${PKG_DIR}/bin/core-runtime.json" \
             "${PKG_DIR}/LICENSE" \
             "${PKG_DIR}/COMMERCIAL-LICENSE.md"; do
-            tar -tzf "dist/${ASSET}" | grep -qxF "$required" \
+            printf '%s\n' "${ENTRIES[@]}" | grep -qxF "$required" \
               || { echo "::error::archive is missing ${required}"; exit 1; }
           done
-          tar -tzf "dist/${ASSET}" | grep -q "^${PKG_DIR}/bin/core-notices/" \
+          printf '%s\n' "${ENTRIES[@]}" | grep -q "^${PKG_DIR}/bin/core-notices/" \
             || { echo "::error::Core SDK notices are missing from the archive"; exit 1; }
-          if tar -tzf "dist/${ASSET}" \
+          if printf '%s\n' "${ENTRIES[@]}" \
             | grep -E '(^|/)(\.env|\.git|\.sdk|target|session\.json)(/|$)|\.db$'; then
             echo "::error::archive contains files that must never be published"
             exit 1
