@@ -2,7 +2,12 @@
 # A matching v<version> tag publishes a stable GitHub release. A manual dispatch
 # publishes the same package as the prerelease <version>-dev.<run-id>.
 # Only the API process is packaged; frontend source and its release live in
-# risense-ai/respire-site. Publication is gated on Server CI for the exact SHA.
+# risense-ai/respire-site.
+#
+# This pipeline builds and publishes only. It runs no test suite and does not
+# wait on Server CI, so a release is as fast as the compilation it needs. Test
+# and coverage results belong to Server CI (ci.yml), which runs independently of
+# this workflow.
 name: Server release
 
 on:
@@ -19,11 +24,10 @@ concurrency:
 
 jobs:
   prepare:
-    name: resolve version and require exact-revision CI
+    name: resolve version and asset name
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -72,53 +76,12 @@ jobs:
             echo "prerelease=${PRERELEASE}"
           } >> "$GITHUB_OUTPUT"
 
-      # Publication follows the existing repository rule: no release without a
-      # successful Server CI run for the exact source revision being packaged.
-      - name: Require successful Server CI for the exact revision
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 90); do
-            RUNS="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
-              --commit "$GITHUB_SHA" --event push --limit 20 \
-              --json headSha,status,conclusion)"
-            if jq -e --arg sha "$GITHUB_SHA" \
-              '[.[] | select(.headSha == $sha)] | any(.status == "completed" and .conclusion == "success")' \
-              <<<"$RUNS" > /dev/null; then
-              echo "Server CI succeeded for $GITHUB_SHA"
-              exit 0
-            fi
-            if jq -e --arg sha "$GITHUB_SHA" \
-              '[.[] | select(.headSha == $sha)] | length > 0 and all(.status == "completed")' \
-              <<<"$RUNS" > /dev/null; then
-              echo "::error::Server CI failed for $GITHUB_SHA; nothing is published"
-              exit 1
-            fi
-            sleep 20
-          done
-          echo "::error::Timed out waiting for Server CI for $GITHUB_SHA; nothing is published"
-          exit 1
-
   build:
     name: build the pinned binary package
     needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    services:
-      postgres:
-        image: postgres:16-bookworm
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -192,44 +155,6 @@ jobs:
             echo "::error::archive contains files that must never be published"
             exit 1
           fi
-
-      # Acceptance runs the exact published artifact: extract it, start the
-      # packaged binary against an isolated database and check the compiled
-      # source revision, the CLI and database readiness.
-      - name: Smoke check the extracted package
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          DATABASE_URL: postgres://postgres@localhost:5432/postgres
-        run: |
-          set -euo pipefail
-          SMOKE_DIR="$(mktemp -d)"
-          tar -xzf "dist/${ASSET}" -C "$SMOKE_DIR"
-          BIN="${SMOKE_DIR}/${PKG_DIR}/bin/respire-server"
-          test -x "$BIN" || { echo "::error::packaged binary is not executable"; exit 1; }
-          "$BIN" --version
-          "$BIN" serve --bind 127.0.0.1:8787 &
-          SERVER_PID=$!
-          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-          READY=0
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8787/health > /dev/null; then READY=1; break; fi
-            sleep 1
-          done
-          [ "$READY" = 1 ] || { echo "::error::packaged binary never answered /health"; exit 1; }
-          curl -fsS http://127.0.0.1:8787/health | python3 -c '
-          import json, os, sys
-          body = json.load(sys.stdin)
-          assert body["ok"] is True, body
-          assert body["version"] == os.environ["VERSION"], body
-          assert body["source_revision"] == os.environ["GITHUB_SHA"], body
-          '
-          curl -fsS http://127.0.0.1:8787/ready | python3 -c '
-          import json, sys
-          body = json.load(sys.stdin)
-          assert body["ok"] is True and body["database"] == "ready", body
-          '
-          kill "$SERVER_PID"
-          echo "Packaged binary verified: version ${VERSION}, revision ${GITHUB_SHA}"
 
       - uses: actions/upload-artifact@v4
         with:

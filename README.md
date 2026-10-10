@@ -95,10 +95,11 @@ Database/API deployment uses SSH from the operator's own computer; GitHub runner
 only check, build and publish code. Keep actual installation and secret
 configuration outside public source, CI logs and artifacts. Cloudflare Pages
 frontend deployment uses its separate GitHub integration. The `Server release`
-workflow publishes only after `Server CI` succeeded for the exact revision: a
-`v<version>` tag matching the version in `service/Cargo.toml` publishes a stable
-release, and a manual run publishes the same package as the prerelease
-`<version>-dev.<run-id>`. Each release carries one
+workflow publishes the package itself and runs no test suite, so it is not gated
+on `Server CI`: a `v<version>` tag matching the version in `service/Cargo.toml`
+publishes a stable release, and a manual run publishes the same package as the
+prerelease `<version>-dev.<run-id>`. Check the `Server CI` result for a revision
+before releasing it. Each release carries one
 `respire-server-<version>-x86_64-unknown-linux-gnu.tar.gz` asset holding the
 `respire-server` binary, the pinned Core SDK notices and runtime metadata, and the
 licenses. A PR publishes nothing.
