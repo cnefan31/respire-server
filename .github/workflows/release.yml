@@ -135,26 +135,43 @@ jobs:
       - name: Inspect the archive contents
         run: |
           set -euo pipefail
-          # List the archive once and match against the captured list. Piping tar
-          # into `grep -q` would make grep exit at its first match, so tar would
-          # die on SIGPIPE and `pipefail` would report a false missing entry whose
-          # position in the listing happens to follow the match.
+          # Capture the listing once and match it in pure bash. Two earlier
+          # versions piped a producer into `grep -q`: grep exits at its first
+          # match, the producer then dies on SIGPIPE, and `pipefail` reports a
+          # failed step for an entry that is actually present. Which entries
+          # passed depended on their position in the listing. Matching a captured
+          # array has no such short-circuit.
           mapfile -t ENTRIES < <(tar -tzf "dist/${ASSET}")
+          contains() {
+            local needle="$1" entry
+            for entry in "${ENTRIES[@]}"; do
+              [[ "$entry" == "$needle" ]] && return 0
+            done
+            return 1
+          }
+          has_prefix() {
+            local prefix="$1" entry
+            for entry in "${ENTRIES[@]}"; do
+              [[ "$entry" == "$prefix"* ]] && return 0
+            done
+            return 1
+          }
           for required in \
             "${PKG_DIR}/bin/respire-server" \
             "${PKG_DIR}/bin/core-runtime.json" \
             "${PKG_DIR}/LICENSE" \
             "${PKG_DIR}/COMMERCIAL-LICENSE.md"; do
-            printf '%s\n' "${ENTRIES[@]}" | grep -qxF "$required" \
+            contains "$required" \
               || { echo "::error::archive is missing ${required}"; exit 1; }
           done
-          printf '%s\n' "${ENTRIES[@]}" | grep -q "^${PKG_DIR}/bin/core-notices/" \
+          has_prefix "${PKG_DIR}/bin/core-notices/" \
             || { echo "::error::Core SDK notices are missing from the archive"; exit 1; }
-          if printf '%s\n' "${ENTRIES[@]}" \
-            | grep -E '(^|/)(\.env|\.git|\.sdk|target|session\.json)(/|$)|\.db$'; then
-            echo "::error::archive contains files that must never be published"
-            exit 1
-          fi
+          for entry in "${ENTRIES[@]}"; do
+            if [[ "$entry" =~ (^|/)(\.env|\.git|\.sdk|target|session\.json)(/|$)|\.db$ ]]; then
+              echo "::error::archive contains a file that must never be published: ${entry}"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
