@@ -211,8 +211,8 @@ Path parameters representing user names are URL-encoded by the retained consumer
 
 ## Ordered rollout and acceptance
 
-1. Review and merge the API and Site changes. Build the API artifact only from
-   the exact server revision that passes Server CI and Server image tests.
+1. Review and merge the API and Site changes. Build the API package only from
+   the exact server revision that passes Server CI.
 2. Deploy **only API** using [API deployment instructions](api-deployment.md),
    configure trusted origins, and verify preflight plus actual successful/error
    responses at the public API endpoint. Existing web containers, web image

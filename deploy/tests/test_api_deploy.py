@@ -8,7 +8,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
@@ -321,92 +320,11 @@ class DeployTest(unittest.TestCase):
 
 
 class WorkflowTest(unittest.TestCase):
-    def test_workflow_packages_only_api_and_checks_exact_revision(self):
-        workflow = (REPO / ".github/workflows/api-deployment-artifact.yml").read_text()
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertNotIn("\n  push:", workflow)
-        self.assertNotIn("\n  pull_request:", workflow)
-        self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn("for workflow in ci.yml server-image.yml", workflow)
-        self.assertIn('--commit "$GITHUB_SHA" --branch main --event push', workflow)
-        self.assertIn("select(.headSha == $sha)", workflow)
-        self.assertIn('sort_by(.createdAt) | last', workflow)
-        self.assertIn('.status == "completed" and .conclusion == "success"', workflow)
-        for forbidden in ("respire-site", "site-sha", "admin-ui", "compose-web", "respire-web", "npm ci"):
-            self.assertNotIn(forbidden, workflow)
-        self.assertIn('docker save "respire-server:$GITHUB_SHA" | gzip', workflow)
-        self.assertIn('org.opencontainers.image.revision=$GITHUB_SHA', workflow)
-        self.assertIn("sha256sum " + " ".join(PAYLOADS) + " > SHA256SUMS", workflow)
-
     def test_safety_suite_runs_for_pull_requests(self):
         workflow = (REPO / ".github/workflows/api-deployment-tests.yml").read_text()
         self.assertIn("pull_request:", workflow)
         self.assertIn("python3 -m unittest discover -s deploy/tests -v", workflow)
         self.assertIn("bash -n deploy/ssh-deploy-api.sh", workflow)
-
-
-@unittest.skipUnless(shutil.which("jq"), "Workflow gate fixtures require jq (provided on GitHub runners)")
-class WorkflowGateTest(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="respire-api-gate-", dir="/tmp")
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        workflow = (REPO / ".github/workflows/api-deployment-artifact.yml").read_text()
-        self.gate = textwrap.dedent(workflow.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
-        gh = self.root / "gh"
-        gh.write_text("""#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-with open(os.environ['STUB_GH_LOG'], 'a') as log:
-    log.write(json.dumps(args) + '\\n')
-print(json.dumps(json.loads(os.environ['STUB_RUNS'])[args[args.index('--workflow') + 1]]))
-""")
-        gh.chmod(0o700)
-        self.log = self.root / "gh.jsonl"
-
-    def run_record(self):
-        return dict(headSha=REVISION, status="completed", conclusion="success",
-                    createdAt="2026-10-04T00:00:00Z")
-
-    def check_gate(self, ci, image, success):
-        env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", GITHUB_SHA=REVISION,
-                   GITHUB_REPOSITORY="fixture/server", GH_TOKEN="fixture-only",
-                   STUB_GH_LOG=str(self.log), STUB_RUNS=json.dumps({"ci.yml": ci, "server-image.yml": image}))
-        result = subprocess.run(["bash", "-c", self.gate], env=env, capture_output=True, text=True)
-        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
-        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        for call in calls:
-            self.assertEqual(call[call.index("--commit") + 1], REVISION)
-            self.assertEqual(call[call.index("--branch") + 1], "main")
-            self.assertEqual(call[call.index("--event") + 1], "push")
-        return calls
-
-    def test_both_exact_successful_workflows_required(self):
-        calls = self.check_gate([self.run_record()], [self.run_record()], True)
-        self.assertEqual([call[call.index("--workflow") + 1] for call in calls], ["ci.yml", "server-image.yml"])
-
-    def test_missing_ci_refuses_artifact(self):
-        self.check_gate([], [self.run_record()], False)
-
-    def test_other_sha_cannot_satisfy_gate(self):
-        wrong = self.run_record()
-        wrong["headSha"] = "f" * 40
-        self.check_gate([wrong], [self.run_record()], False)
-
-    def test_latest_failure_overrides_older_success(self):
-        failed = self.run_record()
-        failed.update(createdAt="2026-10-04T01:00:00Z", conclusion="failure")
-        self.check_gate([failed, self.run_record()], [self.run_record()], False)
-
-    def test_running_rerun_does_not_use_older_success(self):
-        running = self.run_record()
-        running.update(createdAt="2026-10-04T01:00:00Z", status="in_progress", conclusion=None)
-        self.check_gate([self.run_record()], [running, self.run_record()], False)
-
-    def test_failed_server_image_refuses_artifact(self):
-        failed = self.run_record()
-        failed["conclusion"] = "failure"
-        self.check_gate([self.run_record()], [failed], False)
 
 
 if __name__ == "__main__":

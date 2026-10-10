@@ -1,0 +1,301 @@
+# Server binary release pipeline.
+# A matching v<version> tag publishes a stable GitHub release. A manual dispatch
+# publishes the same package as the prerelease <version>-dev.<run-id>.
+# Only the API process is packaged; frontend source and its release live in
+# risense-ai/respire-site. Publication is gated on Server CI for the exact SHA.
+name: Server release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: respire-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: resolve version and require exact-revision CI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      asset: ${{ steps.resolve.outputs.asset }}
+      target: ${{ steps.resolve.outputs.target }}
+      sdk_version: ${{ steps.resolve.outputs.sdk_version }}
+      sdk_archive_sha256: ${{ steps.resolve.outputs.sdk_archive_sha256 }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve the release version, tag and asset name
+        id: resolve
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SERVICE_VERSION="$(awk -F'"' '/^version/{print $2; exit}' service/Cargo.toml)"
+          TARGET=x86_64-unknown-linux-gnu
+          if [[ "$REF_TYPE" == tag ]]; then
+            if [[ "$REF_NAME" != "v${SERVICE_VERSION}" ]]; then
+              echo "::error::tag ${REF_NAME} does not match service/Cargo.toml version ${SERVICE_VERSION} (expected v${SERVICE_VERSION})"
+              exit 1
+            fi
+            VERSION="$SERVICE_VERSION"
+            TAG="$REF_NAME"
+            PRERELEASE=false
+          else
+            VERSION="${SERVICE_VERSION}-dev.${GITHUB_RUN_ID}"
+            TAG="v${VERSION}"
+            PRERELEASE=true
+          fi
+          ASSET="respire-server-${VERSION}-${TARGET}.tar.gz"
+          SDK_VERSION="$(python3 -c "import json;print(json.load(open('sdk/core-sdk.lock.json'))['targets']['${TARGET}']['sdk_version'])")"
+          SDK_ARCHIVE_SHA256="$(python3 -c "import json;print(json.load(open('sdk/core-sdk.lock.json'))['targets']['${TARGET}']['archive_sha256'])")"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "asset=${ASSET}"
+            echo "target=${TARGET}"
+            echo "sdk_version=${SDK_VERSION}"
+            echo "sdk_archive_sha256=${SDK_ARCHIVE_SHA256}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Publication follows the existing repository rule: no release without a
+      # successful Server CI run for the exact source revision being packaged.
+      - name: Require successful Server CI for the exact revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            RUNS="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+              --commit "$GITHUB_SHA" --event push --limit 20 \
+              --json headSha,status,conclusion)"
+            if jq -e --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.headSha == $sha)] | any(.status == "completed" and .conclusion == "success")' \
+              <<<"$RUNS" > /dev/null; then
+              echo "Server CI succeeded for $GITHUB_SHA"
+              exit 0
+            fi
+            if jq -e --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.headSha == $sha)] | length > 0 and all(.status == "completed")' \
+              <<<"$RUNS" > /dev/null; then
+              echo "::error::Server CI failed for $GITHUB_SHA; nothing is published"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Timed out waiting for Server CI for $GITHUB_SHA; nothing is published"
+          exit 1
+
+  build:
+    name: build the pinned binary package
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare pinned binary Core SDK
+        run: node scripts/fetch-core-sdk.mjs "${{ needs.prepare.outputs.target }}"
+
+      - name: Verify the checkout is the packaged revision
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      # build.rs records RSRS_BUILD_REVISION in the binary; /health returns it.
+      - name: Build the release binary
+        env:
+          RSRS_BUILD_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p respire_service --bin respire-server
+
+      - name: Stage the binary, Core SDK notices and package the archive
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ needs.prepare.outputs.target }}
+          ASSET: ${{ needs.prepare.outputs.asset }}
+        run: |
+          set -euo pipefail
+          PKG_DIR="respire-server-${VERSION}-${TARGET}"
+          rm -rf "$PKG_DIR" dist
+          mkdir -p "$PKG_DIR/bin" dist
+          install -m 0755 target/release/respire-server "$PKG_DIR/bin/respire-server"
+          # Copies the pinned SDK's runtime files and license notices next to the
+          # binary and records them in core-runtime.json.
+          node scripts/stage-core-runtime.mjs "$PKG_DIR/bin"
+          cp LICENSE COMMERCIAL-LICENSE.md "$PKG_DIR/"
+          # Sorted ownerless entries and a timestamp-free gzip stream keep the
+          # archive byte-identical for a rerun of the same revision.
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+            -cf - "$PKG_DIR" | gzip -9n > "dist/${ASSET}"
+          echo "PKG_DIR=${PKG_DIR}" >> "$GITHUB_ENV"
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+          ls -l "dist/${ASSET}"
+
+      - name: Inspect the archive contents
+        run: |
+          set -euo pipefail
+          for required in \
+            "${PKG_DIR}/bin/respire-server" \
+            "${PKG_DIR}/bin/core-runtime.json" \
+            "${PKG_DIR}/LICENSE" \
+            "${PKG_DIR}/COMMERCIAL-LICENSE.md"; do
+            tar -tzf "dist/${ASSET}" | grep -qxF "$required" \
+              || { echo "::error::archive is missing ${required}"; exit 1; }
+          done
+          tar -tzf "dist/${ASSET}" | grep -q "^${PKG_DIR}/bin/core-notices/" \
+            || { echo "::error::Core SDK notices are missing from the archive"; exit 1; }
+          if tar -tzf "dist/${ASSET}" \
+            | grep -E '(^|/)(\.env|\.git|\.sdk|target|session\.json)(/|$)|\.db$'; then
+            echo "::error::archive contains files that must never be published"
+            exit 1
+          fi
+
+      # Acceptance runs the exact published artifact: extract it, start the
+      # packaged binary against an isolated database and check the compiled
+      # source revision, the CLI and database readiness.
+      - name: Smoke check the extracted package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DATABASE_URL: postgres://postgres@localhost:5432/postgres
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d)"
+          tar -xzf "dist/${ASSET}" -C "$SMOKE_DIR"
+          BIN="${SMOKE_DIR}/${PKG_DIR}/bin/respire-server"
+          test -x "$BIN" || { echo "::error::packaged binary is not executable"; exit 1; }
+          "$BIN" --version
+          "$BIN" serve --bind 127.0.0.1:8787 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          READY=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/health > /dev/null; then READY=1; break; fi
+            sleep 1
+          done
+          [ "$READY" = 1 ] || { echo "::error::packaged binary never answered /health"; exit 1; }
+          curl -fsS http://127.0.0.1:8787/health | python3 -c '
+          import json, os, sys
+          body = json.load(sys.stdin)
+          assert body["ok"] is True, body
+          assert body["version"] == os.environ["VERSION"], body
+          assert body["source_revision"] == os.environ["GITHUB_SHA"], body
+          '
+          curl -fsS http://127.0.0.1:8787/ready | python3 -c '
+          import json, sys
+          body = json.load(sys.stdin)
+          assert body["ok"] is True and body["database"] == "ready", body
+          '
+          kill "$SERVER_PID"
+          echo "Packaged binary verified: version ${VERSION}, revision ${GITHUB_SHA}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: respire-server-${{ needs.prepare.outputs.version }}
+          path: dist/${{ needs.prepare.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish the GitHub release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: respire-server-${{ needs.prepare.outputs.version }}
+          path: dist
+
+      - name: Publish the package and its provenance notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ASSET: ${{ needs.prepare.outputs.asset }}
+          TARGET: ${{ needs.prepare.outputs.target }}
+          SDK_VERSION: ${{ needs.prepare.outputs.sdk_version }}
+          SDK_ARCHIVE_SHA256: ${{ needs.prepare.outputs.sdk_archive_sha256 }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          test -s "dist/${ASSET}"
+          DIGEST="$(sha256sum "dist/${ASSET}" | awk '{print $1}')"
+          {
+            echo "Respire Server API \`${VERSION}\` for \`${TARGET}\`."
+            echo
+            echo "- Source revision: \`${GITHUB_SHA}\`"
+            echo "- Core SDK: ${SDK_VERSION} (\`sdk/core-sdk.lock.json\`, pinned archive sha256 \`${SDK_ARCHIVE_SHA256}\`)"
+            echo "- Asset: \`${ASSET}\`"
+            echo "- Asset SHA-256: \`${DIGEST}\`"
+            echo
+            echo "The archive holds \`bin/respire-server\`, the pinned Core SDK runtime files and license notices under \`bin/core-notices\` recorded by \`bin/core-runtime.json\`, plus \`LICENSE\` and \`COMMERCIAL-LICENSE.md\`."
+            echo
+            echo "The cloud API stores ciphertext only and never decrypts memories. Deployment is manual SSH from the operator's own computer; see \`docs/api-deployment.md\`. Frontend source and its releases belong to \`risense-ai/respire-site\`. This binary packages the server API process only."
+          } > NOTES.md
+          # A rerun keeps the same run id, so an existing dev release is updated.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            if [[ "$PRERELEASE" == true ]]; then
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" --title "Respire Server ${VERSION}" \
+                --notes-file NOTES.md --prerelease
+            else
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "Respire Server ${VERSION}" --notes-file NOTES.md
+            fi
+          fi
+          gh release upload "$TAG" "dist/${ASSET}" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isPrerelease,assets --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+
+      - name: Summarize the published release
+        if: always()
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          {
+            echo "### Server release ${VERSION}"
+            echo
+            echo "- Tag: \`${TAG}\`"
+            echo "- Revision: \`${GITHUB_SHA}\`"
+            echo "- URL: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"

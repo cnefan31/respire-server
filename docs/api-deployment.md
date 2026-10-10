@@ -1,10 +1,19 @@
 # API-first deployment
 
-The manual **API deployment artifact** workflow packages the server image, the API
-Compose definition, the operator script and an exact checksum manifest. It runs
-only from `main` and requires the latest push run of both `Server CI` (`ci.yml`) and
+> **Producer gap.** The former **API deployment artifact** workflow
+> (`api-deployment-artifact.yml`) and the `Server image` workflow
+> (`server-image.yml`) were retired. Nothing in this repository now produces the
+> `server-image.tar.gz` bundle that `ssh-deploy-api.sh` consumes, so the operator
+> procedure below currently has no automated producer. The `Server release`
+> workflow (`release.yml`) publishes the API **binary** package instead. Restore a
+> producer workflow before using this procedure, or deploy from a locally built
+> image bundle.
+
+The retired artifact workflow packaged the server image, the API Compose
+definition, the operator script and an exact checksum manifest. It ran only from
+`main` and required the latest push run of both `Server CI` (`ci.yml`) and
 `Server image` (`server-image.yml`) for the dispatched SHA to have completed
-successfully. It does not check out Site, build a console, package a web image,
+successfully. It did not check out Site, build a console, package a web image,
 publish a release, or connect to a host. Artifact creation is not a deployment.
 
 Source ownership and production rollout are separate. The old web image/container
@@ -67,10 +76,11 @@ existing API connection URL. Never recreate or rename a database to fit a defaul
 
 ## Deploy the API
 
-Download and extract `api-deployment-<server SHA>` from the successful manual run.
-Inspect its files, transfer them from your computer with SCP, and execute in an
-operator SSH session. The following variables must be supplied from private
-operator configuration; no environment-to-installation mapping is built in:
+Download and extract the API deployment artifact bundle produced from the exact
+reviewed source revision. Inspect its files, transfer them from your computer with
+SCP, and execute in an operator SSH session. The following variables must be
+supplied from private operator configuration; no environment-to-installation
+mapping is built in:
 
 ```bash
 cd "$ARTIFACT_DIRECTORY"
@@ -170,8 +180,7 @@ Tests substitute recording Docker/curl executables and fake installation directo
 under `/tmp`; they never use a daemon, network or live database. Tests pass their
 temporary installation, fixture project and port through the same public interface.
 CI-gate fixtures use local `jq` (included on GitHub runners) and skip explicitly
-if it is unavailable. The PR safety workflow runs these tests, and artifact creation
-runs them again.
+if it is unavailable. The PR safety workflow runs these tests.
 These tests verify command isolation, state preservation and failure handling; a
 real Docker/Compose rehearsal is still required before a production rollout.
 

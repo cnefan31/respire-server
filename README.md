@@ -77,13 +77,13 @@ The generic example and Compose fallback are production values, so a DEV setup
 must override them. Verify that `/oauth/device/code` returns a verification link
 on the selected Dashboard before accepting CLI/TUI login.
 
-Use the manual **API deployment artifact** workflow after Server CI and Server
-image succeed for the exact source revision. It packages only the API image and
-API deployment files. [API deployment and rollback](docs/api-deployment.md) preserve
-the existing PostgreSQL database and already-running legacy web containers,
-images, environment files and routes. Frontend source removal does not retire
-that runtime. Keep rollback images/configuration before migration; do not prune
-them until the verified cutover and rollback window have completed.
+`Server CI` checks, tests and builds the API. The `Server release` workflow
+(`release.yml`) publishes the API binary package described below. [API deployment
+and rollback](docs/api-deployment.md) preserve the existing PostgreSQL database and
+already-running legacy web containers, images, environment files and routes.
+Frontend source removal does not retire that runtime. Keep rollback
+images/configuration before migration; do not prune them until the verified
+cutover and rollback window have completed.
 
 `deploy/backup-database.sh` takes and verifies PostgreSQL dumps, retaining seven
 backups. Pass the installation directory, Compose project and backup directory
@@ -92,13 +92,16 @@ on a database that must be preserved. Builds still need the checksum-pinned Core
 SDK; Node remains a backend build dependency for SDK download/staging.
 
 Database/API deployment uses SSH from the operator's own computer; GitHub runners
-only check and build code. Keep actual installation and secret configuration
-outside public source, CI logs and artifacts. Cloudflare Pages frontend deployment
-uses its separate GitHub integration. After exact-revision CI and image smoke checks pass,
-a push to `main` publishes `<version>-dev.<run-id>`, `dev`, and an immutable
-source-SHA image. A matching `v<version>` tag publishes the stable version and
-`latest`. Manual image validation publishes only when `publish_image` is
-explicitly selected on a matching version tag. A PR does not deploy anything.
+only check, build and publish code. Keep actual installation and secret
+configuration outside public source, CI logs and artifacts. Cloudflare Pages
+frontend deployment uses its separate GitHub integration. The `Server release`
+workflow publishes only after `Server CI` succeeded for the exact revision: a
+`v<version>` tag matching the version in `service/Cargo.toml` publishes a stable
+release, and a manual run publishes the same package as the prerelease
+`<version>-dev.<run-id>`. Each release carries one
+`respire-server-<version>-x86_64-unknown-linux-gnu.tar.gz` asset holding the
+`respire-server` binary, the pinned Core SDK notices and runtime metadata, and the
+licenses. A PR publishes nothing.
 
 ## Retired legacy local console
 
